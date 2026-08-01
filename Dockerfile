@@ -1,13 +1,19 @@
 FROM python:3.11-slim
 
-# Install ffmpeg + Bangla font (Noto Sans Bengali)
+# Install ffmpeg + certs + curl
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ffmpeg \
-        fonts-noto-bengali \
         ca-certificates \
-        curl && \
+        curl \
+        fontconfig && \
     rm -rf /var/lib/apt/lists/*
+
+# Bangla font (Noto Sans Bengali) - direct download, apt package name unreliable across base images
+RUN mkdir -p /usr/share/fonts/truetype/noto-bengali && \
+    curl -sL -o /usr/share/fonts/truetype/noto-bengali/NotoSansBengali-Regular.ttf \
+        "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSansBengali/NotoSansBengali-Regular.ttf" && \
+    fc-cache -f
 
 WORKDIR /app
 
