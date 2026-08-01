@@ -20,6 +20,7 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=str(BASE_DIR)), name="files")
 
 VOICE = "bn-BD-NabanitaNeural"
+MAX_TTS_ATTEMPTS = 3
 
 
 def ms_to_srt_time(ms: float) -> str:
@@ -31,14 +32,65 @@ def ms_to_srt_time(ms: float) -> str:
 
 
 def get_base_url() -> str:
-    # Render.com sets this automatically. Fallback for local testing.
     external = os.environ.get("RENDER_EXTERNAL_URL")
     if external:
         return external.rstrip("/")
     return "http://localhost:8000"
 
 
-# ---------------------- TTS ----------------------
+async def run_tts_once(script: str, voice: str, audio_path: Path):
+    """Run a single edge_tts pass. Returns (words, audio_chunks)."""
+    words = []
+    audio_chunks = 0
+    communicate = edge_tts.Communicate(script, voice)
+    with open(audio_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+                audio_chunks += 1
+            elif chunk["type"] == "WordBoundary":
+                words.append(chunk)
+    return words, audio_chunks
+
+
+async def generate_tts_with_retry(script: str, voice: str, audio_path: Path):
+    """
+    edge_tts's websocket connection to Microsoft's endpoint can drop mid-stream
+    (common on free-tier hosts like Render). Retry a few times with backoff,
+    and treat a stream that produced very little audio relative to script
+    length as a failed attempt, not a success.
+    """
+    script_len = len(script)
+    last_error = None
+    last_words = []
+    last_chunks = 0
+
+    for attempt in range(1, MAX_TTS_ATTEMPTS + 1):
+        try:
+            words, audio_chunks = await run_tts_once(script, voice, audio_path)
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            words, audio_chunks = [], 0
+
+        audio_size = audio_path.stat().st_size if audio_path.exists() else 0
+        last_words, last_chunks = words, audio_chunks
+
+        stream_too_short = script_len > 200 and audio_chunks < 5
+
+        if audio_size > 0 and not stream_too_short:
+            return words, audio_chunks, audio_size, None
+
+        last_error = last_error or (
+            f"stream ended early (audio_chunks={audio_chunks}, "
+            f"audio_size={audio_size}, script_len={script_len})"
+        )
+
+        if attempt < MAX_TTS_ATTEMPTS:
+            await asyncio.sleep(1.5 * attempt)
+
+    audio_size = audio_path.stat().st_size if audio_path.exists() else 0
+    return last_words, last_chunks, audio_size, last_error
+
 
 class TTSRequest(BaseModel):
     script: str
@@ -58,32 +110,22 @@ async def generate_tts(req: TTSRequest):
     srt_path = job_dir / "captions.srt"
 
     voice = req.voice or VOICE
-    communicate = edge_tts.Communicate(req.script, voice)
-    words = []
-    try:
-        with open(audio_path, "wb") as f:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    words.append(chunk)
-    except Exception as e:
-        raise HTTPException(500, f"edge_tts stream failed: {type(e).__name__}: {e}")
+    words, audio_chunks, audio_size, error = await generate_tts_with_retry(
+        req.script, voice, audio_path
+    )
 
-    audio_size = audio_path.stat().st_size if audio_path.exists() else 0
     if audio_size == 0:
-        raise HTTPException(500, f"TTS failed completely: no audio bytes written (voice={voice})")
+        raise HTTPException(
+            500,
+            f"TTS produced zero bytes after {MAX_TTS_ATTEMPTS} attempts. "
+            f"voice={voice} script_len={len(req.script)} error={error}"
+        )
 
-    if not words:
-        # audio আছে কিন্তু word boundary নাই — SRT ছাড়া চালিয়ে যাও, error না দিয়ে
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write("")
-    else:
-        with open(srt_path, "w", encoding="utf-8") as f:
-            for i, w in enumerate(words, start=1):
-                start = w["offset"] / 10000
-                end = (w["offset"] + w["duration"]) / 10000
-                f.write(f"{i}\n{ms_to_srt_time(start)} --> {ms_to_srt_time(end)}\n{w['text']}\n\n")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, w in enumerate(words, start=1):
+            start = w["offset"] / 10000
+            end = (w["offset"] + w["duration"]) / 10000
+            f.write(f"{i}\n{ms_to_srt_time(start)} --> {ms_to_srt_time(end)}\n{w['text']}\n\n")
 
     base = get_base_url()
     return {
@@ -91,10 +133,11 @@ async def generate_tts(req: TTSRequest):
         "audio_url": f"{base}/files/{job_id}/audio.mp3",
         "srt_url": f"{base}/files/{job_id}/captions.srt",
         "word_count": len(words),
+        "audio_chunks": audio_chunks,
+        "audio_bytes": audio_size,
+        "warning": error,
     }
 
-
-# ---------------------- ASSEMBLE ----------------------
 
 class AssembleRequest(BaseModel):
     job_id: str
@@ -113,14 +156,12 @@ async def assemble_video(req: AssembleRequest):
     broll_path = job_dir / "broll.mp4"
     final_path = job_dir / "final.mp4"
 
-    # Download broll video
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.get(req.broll_url)
         if resp.status_code != 200:
             raise HTTPException(400, f"Failed to download broll_url: HTTP {resp.status_code}")
         broll_path.write_bytes(resp.content)
 
-    # Get audio duration
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_path)],
         capture_output=True, text=True
@@ -129,7 +170,6 @@ async def assemble_video(req: AssembleRequest):
         raise HTTPException(500, f"ffprobe failed: {probe.stderr}")
     audio_dur = probe.stdout.strip()
 
-    # Assemble with ffmpeg: loop broll, burn subtitles, mux audio
     vf = (
         f"scale=1080:1920:force_original_aspect_ratio=increase,"
         f"crop=1080:1920,"
