@@ -17,7 +17,7 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=str(BASE_DIR)), name="files")
 
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel, multilingual-capable
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "bD9maNcCuQQS75DGuteM")  # Sadie, added to My Voices
 ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 
 
